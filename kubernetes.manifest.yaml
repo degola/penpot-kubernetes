@@ -1,0 +1,331 @@
+# # PENPOINT SERVICE DEPENDENCIES (pvc, postgres, redis)
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: penpot-assets-pvc
+spec:
+  accessModes:
+    - ReadWriteMany
+  resources:
+    requests:
+      storage: 10Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: penpot-postgres-pvc
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: penpot-postgres
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: penpot-postgres
+  template:
+    metadata:
+      labels:
+        app: penpot-postgres
+    spec:
+      containers:
+        - name: penpot-postgres
+          image: postgres:15
+          ports:
+            - containerPort: 5432
+          env:
+            - name: POSTGRES_INITDB_ARGS
+              value: "--data-checksums"
+            - name: POSTGRES_DB
+              value: "penpot"
+            - name: POSTGRES_USER
+              valueFrom:
+                secretKeyRef:
+                  name: penpot-backend-secrets
+                  key: PENPOT_DATABASE_USERNAME
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: penpot-backend-secrets
+                  key: PENPOT_DATABASE_PASSWORD
+
+          volumeMounts:
+            - name: penpot-postgres-data
+              mountPath: /var/lib/postgresql
+      volumes:
+        - name: penpot-postgres-data
+          persistentVolumeClaim:
+            claimName: penpot-postgres-pvc
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: penpot-postgres
+spec:
+  selector:
+    app: penpot-postgres
+  ports:
+    - protocol: TCP
+      port: 5432
+      targetPort: 5432
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: penpot-redis
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: penpot-redis
+  template:
+    metadata:
+      labels:
+        app: penpot-redis
+    spec:
+      containers:
+        - name: penpot-redis
+          image: redis:7
+          ports:
+            - containerPort: 6379
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: penpot-redis
+spec:
+  selector:
+    app: penpot-redis
+  ports:
+    - protocol: TCP
+      port: 6379
+      targetPort: 6379
+
+
+# PENPOINT FRONTEND
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: penpot-frontend
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: penpot-frontend
+  template:
+    metadata:
+      labels:
+        app: penpot-frontend
+    spec:
+      containers:
+        - name: penpot-frontend
+          image: penpotapp/frontend:latest
+          ports:
+            - containerPort: 80
+          envFrom:
+            - secretRef:
+                name: penpot-common-secrets
+            - secretRef:
+                name: penpot-frontend-secrets
+          volumeMounts:
+            - name: penpot-assets
+              mountPath: /opt/data/assets
+      volumes:
+        - name: penpot-assets
+          persistentVolumeClaim:
+            claimName: penpot-assets-pvc
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: penpot-frontend
+spec:
+  selector:
+    app: penpot-frontend
+  ports:
+    - protocol: TCP
+      port: 9001
+      targetPort: 80
+
+
+# PENPOINT BACKEND
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: penpot-backend
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: penpot-backend
+  template:
+    metadata:
+      labels:
+        app: penpot-backend
+    spec:
+      containers:
+        - name: penpot-backend
+          image: penpotapp/backend:latest
+          ports:
+            - containerPort: 6060
+          volumeMounts:
+            - name: penpot-assets
+              mountPath: /opt/data/assets
+          envFrom:
+            - secretRef:
+                name: penpot-backend-secrets
+      volumes:
+        - name: penpot-assets
+          persistentVolumeClaim:
+            claimName: penpot-assets-pvc
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: penpot-backend
+spec:
+  selector:
+    app: penpot-backend
+  ports:
+    - protocol: TCP
+      port: 9002
+      targetPort: 6060
+
+# PENPOT EXPORTER
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: penpot-exporter
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: penpot-exporter
+  template:
+    metadata:
+      labels:
+        app: penpot-exporter
+    spec:
+      containers:
+        - name: penpot-exporter
+          image: penpotapp/exporter:latest
+          ports:
+            - containerPort: 6061
+          envFrom:
+            - secretRef:
+                name: penpot-common-secrets
+          env:
+            # we use the internal kubernetes service resolving
+            - name: PENPOT_PUBLIC_URI
+              value: "http://penpot-frontend:9001"
+            - name: PENPOT_REDIS_URI
+              value: "redis://penpot-redis/0"
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: penpot-exporter
+spec:
+  selector:
+    app: penpot-exporter
+  ports:
+    - protocol: TCP
+      port: 9003
+      targetPort: 6061
+
+
+# PENPOT INGRESS CONFIGURATION
+---
+# INGRESS FOR FRONTEND
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: penpot-http-ingress
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-body-size: 100m
+spec:
+  rules:
+    - host: "${PENPOT_DOMAIN}"
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: penpot-frontend
+                port:
+                  number: 9001
+---
+# INGRESS FOR EXPORTER
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: penpot-exporter-http-ingress
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-body-size: 100m
+spec:
+  rules:
+    - host: "${PENPOT_DOMAIN}"
+      http:
+        paths:
+          - path: /api/export
+            pathType: Prefix
+            backend:
+              service:
+                name: penpot-exporter
+                port:
+                  number: 9003
+---
+# INGRESS PATHS FOR BACKEND
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: penpot-backend-http-ingress
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-body-size: 100m
+spec:
+  rules:
+    - host: "${PENPOT_DOMAIN}"
+      http:
+        paths:
+          - path: /api
+            pathType: Prefix
+            backend:
+              service:
+                name: penpot-backend
+                port:
+                  number: 9002
+          - path: /assets
+            pathType: Prefix
+            backend:
+              service:
+                name: penpot-backend
+                port:
+                  number: 9002
+          - path: /webhooks
+            pathType: Prefix
+            backend:
+              service:
+                name: penpot-backend
+                port:
+                  number: 9002
+          - path: /ws/notifications
+            pathType: Prefix
+            backend:
+              service:
+                name: penpot-backend
+                port:
+                  number: 9002
